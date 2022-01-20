@@ -460,7 +460,29 @@ class SDNet(nn.Module):
 
 
 class DepthInferenceModule:
-    """
+    """Stand-alone wrapper for the SDN model to generate depth map predictions.
+
+    Input:
+        1. Pair of stereo images (img_L, img_R) in PIL.Image format
+        2. Projection constant (f_u * b) [px*m] value
+               f_u: Focal length in sensor x-direction [px]
+               b: Stereo camera separation distance [m]
+        (3. SDN model parameter file path (.pth))
+
+    Returns:
+        Depth map prediction [m] for left image.
+
+    How to use:
+
+        # 1. Import module
+        from depth_inference_module import DepthInferenceModule
+
+        # 2. Initialize module
+        depth_module = DepthInferenceModule(model_path, proj_const)
+
+        # 3. Do inference
+        depth_map = depth_module.predict(img_L, img_R)
+
     """
 
     def __init__(self,
@@ -470,41 +492,38 @@ class DepthInferenceModule:
                  maxdisp: int = 192,
                  down: float = 2,
                  maxdepth: int = 80):
-        """
+        """Initialize the model, constants, and transformations.
         Args:
-            model_path:
-            proj_const:
-            use_gpu:
+            model_path: Path to a SDN .pth file.
+            proj_const: Projection constant (f_u * b) value.
         """
-
+        # Initialize model
         self.model = SDNet(maxdepth=maxdepth, maxdisp=maxdisp, down=down)
-
+        # Load parameters
         state_dict = torch.load(model_path)['state_dict']
-        new_state_dict = {}
-        for key in state_dict.keys():
-            new_key = key.replace("module.", "")
-            new_state_dict[new_key] = state_dict[key]
-        state_dict = new_state_dict
-
+        state_dict = self.modify_state_dict_(state_dict)
         self.model.load_state_dict(state_dict)
-
+        # Store variables
         self.proj_const = torch.tensor(proj_const).unsqueeze(0)
+        # Setup GPU
         self.use_gpu = use_gpu
-
         self.model.eval()
         if self.use_gpu:
             self.model.cuda()
             self.proj_const = self.proj_const.cuda()
-
+        # Transforms
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
         self.trans = transforms.Compose([
             transforms.ToTensor(),
             normalize,
         ])
+        # Set constants
+        # Input size must be divisible by this number
+        self.FRAC_REQ = 16
 
     def predict(self, img_L: Image, img_R: Image) -> np.array:
-        """
+        """Generates a depth map in [m] from a stereo image pair.
         Args:
             img_L:
             img_R:
@@ -514,12 +533,10 @@ class DepthInferenceModule:
         img_L = self.trans(img_L).unsqueeze(0)
         img_R = self.trans(img_R).unsqueeze(0)
 
-        # pad to (375, 1242) --> (384, 1248)
-        B, C, H, W = img_L.shape
-        top_pad = 384 - H
-        right_pad = 1248 - W
-        img_L = F.pad(img_L, (0, right_pad, top_pad, 0), "constant", 0)
-        img_R = F.pad(img_R, (0, right_pad, top_pad, 0), "constant", 0)
+        _, _, H_orig, W_orig = img_L.shape
+
+        img_L = self.add_padding_(img_L)
+        img_R = self.add_padding_(img_R)
 
         if self.use_gpu:
             img_L = img_L.cuda()
@@ -528,18 +545,60 @@ class DepthInferenceModule:
         with torch.no_grad():
             depth_pred = self.model(img_L, img_R, self.proj_const)
 
+        # Undo padding
+        depth_pred = self.remove_padding_(depth_pred, H_orig, W_orig)
+
         if self.use_gpu:
             depth_pred = depth_pred.cpu().numpy()
 
         return depth_pred
 
     def update_proj_const(self, new_proj_const: float):
-        """
-        """
         self.proj_const = new_proj_const
+
+    @staticmethod
+    def modify_state_dict_(state_dict):
+        """Returns a modified state dictionary without the superflous prefix.
+        """
+        mod_state_dict = {}
+        for key in state_dict.keys():
+            mod_key = key.replace("module.", "")
+            mod_state_dict[mod_key] = state_dict[key]
+
+        return mod_state_dict
+
+    def add_padding_(self, img: torch.Tensor) -> torch.Tensor:
+        """Adds padding for image to conform to image size restriction.
+        NOTE: Padded region can be cropped from the output.
+        """
+        _, _, H, W = img.shape
+
+        # Compute input size which factorize by 16
+        if H % self.FRAC_REQ == 0:
+            H_input = H
+        else:
+            H_input = H + self.FRAC_REQ - H % self.FRAC_REQ
+        if W % self.FRAC_REQ == 0:
+            W_input = W
+        else:
+            W_input = W + self.FRAC_REQ - W % self.FRAC_REQ
+
+        top_pad = H_input - H
+        right_pad = W_input - W
+        img = F.pad(img, (0, right_pad, 0, top_pad), "constant", 0)
+
+        return img
+
+    def remove_padding_(self, img: torch.Tensor, H_orig: int,
+                        W_orig: int) -> torch.Tensor:
+        """Slices out the original image without the padded region.
+        """
+        return img[:, :H_orig, :W_orig]
 
 
 if __name__ == "__main__":
+    """Example usage and test script.
+    """
 
     import matplotlib.pyplot as plt
 
@@ -574,8 +633,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    img_L = Image.open(args.img_L_path)  # .convert('RGB')
-    img_R = Image.open(args.img_R_path)  # .convert('RGB')
+    img_L = Image.open(args.img_L_path)
+    img_R = Image.open(args.img_R_path)
 
     depth_module = DepthInferenceModule(args.model_path, args.proj_const)
 
